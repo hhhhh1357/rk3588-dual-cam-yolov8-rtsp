@@ -1,0 +1,14 @@
+# build artifacts
+build/
+install/
+*.o
+*.a
+
+# python
+__pycache__/
+*.pyc
+
+# misc
+*.log
+.vscode/
+.cache/
