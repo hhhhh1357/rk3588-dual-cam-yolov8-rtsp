@@ -32,6 +32,10 @@ CPU memcpy 以及管线内编码的 RGA 转换，RTSP 侧负载从 ~3 MB/帧降�
   关键帧即可开始解码。
 - **多客户端不阻塞**：每个连接独立 media + appsrc，编码线程广播；慢客户端被
   `leaky=downstream` 队列丢弃。
+- **内存不泄漏**：编码线程对每编码帧释放 `gst_buffer_new_allocate` 的基引用，VmRSS
+  长时间采样实测涨速 ≈ 0 MB/h（曾丢失该 unref 导致每帧漏一个 GstBuffer ≈16.7KB，已修复）。
+- **自带验收测试套件**：`acceptance_tests/` 9 个脚本覆盖起播/帧率/码率/RTP 丢包/内存曲线/
+  并发韧性/TCP 结果协议，测试脚本按 `/proc/<pid>/exe` 校验被采进程真身（见下节）。
 - **结果 TCP 服务器**：16 字节长度前缀帧协议解决粘包/拆包，事件 FIFO 广播，慢客户端
   超阈值自动断开，`MSG_NOSIGNAL` 防 SIGPIPE。
 
@@ -128,7 +132,40 @@ support/ common.h image_utils.h file_utils.{h,c}
             yolov8.cc 已裁剪掉本工程不用的图像解码路径
 model/   yolov8.rknn（demo 模型，见 model/README.md）
 scripts/ result_receiver_demo.py / rtsp_probe_client.py（Python 客户端工具）
+acceptance_tests/  主机侧验收测试套件 0X_*.{sh,py}（测什么/怎么判见下节）
 ```
+
+## Acceptance Tests / 验收测试套件
+
+`acceptance_tests/` 在**主机侧**运行，通过网络对「正在板子上运行的本程序」做可量化验收：
+每个脚本自带「测什么 / 怎么测 / 怎么判」，原始采样写进 `acceptance_tests/artifacts/`
+（已 gitignore，不入库；验收完打包该目录即一份带原始数据的记录）。
+
+| 脚本 | 验收项 |
+|---|---|
+| `01_livestream_check.sh` | 双路起播、起播延迟、一路故障另一路不中断 |
+| `02_fps_check.sh` | 解码层实际帧率（30 fps 标称）与 CBR 4 Mbps 码率 |
+| `03_rtsp_probe.py` | 自实现 RTSP 握手，到 RTP 层统计序列号缺口（丢包） |
+| `04_longrun_stability.sh` | 周期性探针长时间不掉流、零丢包 |
+| `05_mem_watch.py` | 按 `/proc/<pid>/exe` 校验真进程后采 VmRSS 曲线，斜率判泄漏 |
+| `06_perf_sample.sh` | 进程 CPU + NPU 核负载，带时间戳采样 |
+| `07_concurrent_clients.sh` | 多客户端 + SIGSTOP 模拟慢客户端，验证不互拖 |
+| `08_reconnect_stress.sh` | 反复断开/重连后服务存活、新连接可用 |
+| `09_tcp_result_reconnect.py` | TCP 结果帧按长度前缀精确切帧、magic/版本校验 |
+
+先决条件：主机有 `ffmpeg ffprobe python3 ssh`；板子 ssh 免密、本程序已在跑。
+板子 IP / 端口 / 进程名在 `acceptance_tests/config.env` 统一配置，可被环境变量覆盖。
+
+```bash
+cd acceptance_tests
+./01_livestream_check.sh                          # 起播 + 起播延迟
+./02_fps_check.sh && ./02_fps_check.sh -b         # 帧率 + CBR 码率
+python3 03_rtsp_probe.py                          # RTP 层零丢包
+python3 05_mem_watch.py --duration-h 2            # VmRSS 内存曲线 2 小时
+```
+
+本仓库 H.265 零拷贝链路即由该套件完成验收：实测 30 fps、CBR 4.06 Mbps、RTP 长稳零丢包；
+`gst_buffer_unref` 泄漏修复后 VmRSS 涨速 ≈0 MB/h（验收记录为本地 artifacts/ 日志，未入库）。
 
 ## Zero-Copy & Thread-Safety / 零拷贝与线程同步要点
 
