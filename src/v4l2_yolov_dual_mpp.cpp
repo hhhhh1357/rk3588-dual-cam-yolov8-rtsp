@@ -687,6 +687,13 @@ static void mpp_encode_thread_func(CameraPipeline *cam) {
                         gst_app_src_push_buffer(GST_APP_SRC(a), gst_buffer_ref(buffer));
                         gst_object_unref(a);
                     }
+                    // Release the base reference from gst_buffer_new_allocate: each
+                    // gst_app_src_push_buffer() consumes only the per-client +1 copy,
+                    // so failing to unref here leaks one GstBuffer per encoded frame
+                    // (≈ the H.265 bytes of that frame, ~16.7 KB/frame at 4 Mbps @30fps).
+                    // With zero clients the loop body never runs, and this unref is
+                    // exactly what returns the buffer to the pool.
+                    gst_buffer_unref(buffer);
                 } else {
                     gst_buffer_unref(buffer);
                 }
