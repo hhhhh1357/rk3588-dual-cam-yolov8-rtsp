@@ -36,6 +36,8 @@ CPU memcpy 以及管线内编码的 RGA 转换，RTSP 侧负载从 ~3 MB/帧降�
   长时间采样实测涨速 ≈ 0 MB/h（曾丢失该 unref 导致每帧漏一个 GstBuffer ≈16.7KB，已修复）。
 - **自带验收测试套件**：`acceptance_tests/` 9 个脚本覆盖起播/帧率/码率/RTP 丢包/内存曲线/
   并发韧性/TCP 结果协议，测试脚本按 `/proc/<pid>/exe` 校验被采进程真身（见下节）。
+- **进程内看门狗**：心跳监控采集/推理/编码线程，任一卡死或意外退出即打日志并以非 0
+  退出，交给外部 supervisor 拉起（见 Watchdog 节），无人值守自愈。
 - **结果 TCP 服务器**：16 字节长度前缀帧协议解决粘包/拆包，事件 FIFO 广播，慢客户端
   超阈值自动断开，`MSG_NOSIGNAL` 防 SIGPIPE。
 
@@ -88,6 +90,28 @@ cmake --build build -j
 | `result_port` | `9000` | 检测结果 TCP 端口 |
 
 例：`./v4l2_yolov_dual_mpp ./model/yolov8.rknn`
+
+## Watchdog / 看门狗
+
+无人值守自愈：三个工作线程（采集 / 推理 / H.265 编码）每处理完一帧就刷新自己的心跳
+（正常 30fps 约 33 ms 一跳）；一个看门狗线程每秒检查一次。只要某一路**正在出流**
+（`capture_ready==1`），其任一工作线程心跳停滞 > 5 s 或意外退出，看门狗就打印原因并
+以**退出码 2** 终止进程，交由外部 supervisor 整体重启——卡死的线程可能永远 join 不上，
+进程内重入 V4L2 / RGA / NPU / MPP 清不干净，整体重启最可靠。
+
+启动时因无传感器而优雅降级的那一路（`capture_ready==-1`，从不挂 RTSP）不在监控范围，
+不会误报。
+
+配合外部拉起的最简示例：
+
+```bash
+while true; do ./v4l2_yolov_dual_mpp ./model/yolov8.rknn
+  [ $? -eq 0 ] && break      # 正常退出(0)：不再拉起
+  sleep 1                    # 故障退出(2)：自动重启
+done
+```
+
+或 systemd `Restart=always`。
 
 ## View / 观看与结果
 

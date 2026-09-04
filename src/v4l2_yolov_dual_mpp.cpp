@@ -44,6 +44,7 @@
 
 #include <opencv2/opencv.hpp>
 
+#include <chrono>
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -89,6 +90,17 @@
 #define RTSP_ENCODE_BPS         4000000  // 4 Mbps CBR per stream
 #define RTSP_ENCODE_FPS         30
 #define RTSP_ENCODE_GOP         15       // one keyframe every 0.5 s
+
+// Watchdog role indices into CameraPipeline::wd_hb_us / wd_exited.  Defined
+// before CameraPipeline so the struct can size its per-worker arrays.
+#define WD_ROLE_CAP   0        // capture thread
+#define WD_ROLE_INF   1        // inference thread
+#define WD_ROLE_ENC   2        // MPP encode thread
+#define WD_N_ROLES    3
+#define WD_TICK_MS    1000             // watchdog checks the heartbeats every 1 s
+#define WD_TIMEOUT_US 5000000ULL       // no heartbeat for > 5 s => worker wedged
+                                       // (a healthy 30 fps pipeline refreshes
+                                       //  every ~33 ms)
 
 // V4L2 captured buffer fds
 typedef struct {
@@ -147,6 +159,15 @@ struct CameraPipeline {
     // STREAMON (e.g. no sensor attached) degrades cleanly like an open failure.
     std::atomic<int>  capture_ready{0};
 
+    // Watchdog heartbeats (monotonic microseconds).  Each worker refreshes only
+    // its own slot, and only when it makes progress; the watchdog thread treats
+    // a stall longer than WD_TIMEOUT_US, or a worker exiting while the stream is
+    // up, as a fault and forces a non-zero exit (see the watchdog section below).
+    // g_cams is a static global, so these are zero-initialized
+    // (0 = "worker not started yet"); no brace-init needed for C++11 atomics.
+    std::atomic<uint64_t> wd_hb_us[WD_N_ROLES];
+    std::atomic<int>      wd_exited[WD_N_ROLES];
+
     // Detection results (per camera, so boxes never cross cameras)
     std::mutex result_mutex;
     object_detect_result_list od_results;
@@ -186,6 +207,86 @@ static void signal_handler(int signo) {
         fprintf(stderr, "\nReceived signal %d, stopping...\n", signo);
         g_running = false;
     }
+}
+
+// ============== Watchdog: heartbeat supervision of the worker threads ==============
+// Unattended deployment: nothing in-process used to notice a capture/inference/
+// encode thread that wedged (blocked in an ioctl / rknn / MPP call) or exited
+// unexpectedly while RTSP was still mounted - the stream just silently died.
+//
+// Every worker therefore refreshes its own heartbeat slot (monotonic us) as it
+// makes progress; a healthy 30 fps pipeline refreshes about every 33 ms.  The
+// watchdog thread below checks, once per second, that the capture/inference/
+// encode threads of every camera that is actually streaming (capture_ready==1)
+// are both alive and recent.  If one is not, the pipeline cannot be unwound
+// safely in-process (a wedged thread may never join, and re-entering
+// V4L2/RGA/NPU/MPP risks leaks), so the watchdog logs the reason and _exit()s
+// non-zero.  An external supervisor (systemd Restart=always, a launch-shell
+// loop, ...) then restarts the whole application.
+//
+// Cameras that gracefully degraded during startup (e.g. no sensor attached:
+// STREAMON failed, capture_ready==-1, never mounted on RTSP) are outside the
+// watchdog's scope by design and will not cause false alarms.
+
+// A scope guard that flips wd_exited[role] to 1 when its worker returns, for
+// any reason.  The watchdog treats "exited while the stream is up" as a fault.
+class WorkerExitFlag {
+    std::atomic<int> *flag_;
+public:
+    explicit WorkerExitFlag(std::atomic<int> &f) : flag_(&f) {
+        flag_->store(0, std::memory_order_release);
+    }
+    ~WorkerExitFlag() {
+        flag_->store(1, std::memory_order_release);
+    }
+};
+
+static inline uint64_t now_monotonic_us() {
+    auto t = std::chrono::steady_clock::now().time_since_epoch();
+    return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t).count();
+}
+
+static const char *g_wd_role_name[WD_N_ROLES] = {"capture", "inference", "encoder"};
+
+enum WdFaultKind { WD_OK = 0, WD_EXITED, WD_STALLED };
+
+// Returns WD_EXITED / WD_STALLED (and the offending role) if a camera that is
+// actually streaming has a dead or wedged worker, else WD_OK.  Cameras that
+// never reached streaming are skipped.
+static int wd_camera_fault(CameraPipeline *cam, uint64_t now, int *role_out) {
+    if (!cam->enabled || cam->capture_ready.load(std::memory_order_acquire) != 1)
+        return WD_OK;
+    for (int r = 0; r < WD_N_ROLES; r++) {
+        if (cam->wd_exited[r].load(std::memory_order_acquire)) { *role_out = r; return WD_EXITED; }
+        const uint64_t last = cam->wd_hb_us[r].load(std::memory_order_acquire);
+        if (last && now - last > WD_TIMEOUT_US)                { *role_out = r; return WD_STALLED; }
+    }
+    return WD_OK;
+}
+
+static void watchdog_thread_func() {
+    printf("Watchdog thread started (tick %d ms, heartbeat timeout %.1f s).\n",
+           WD_TICK_MS, (double)WD_TIMEOUT_US / 1e6);
+    while (g_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(WD_TICK_MS));
+        if (!g_running) break;
+        const uint64_t now = now_monotonic_us();
+        for (int ci = 0; ci < MAX_CAMS; ci++) {
+            int role = 0;
+            const int kind = wd_camera_fault(&g_cams[ci], now, &role);
+            if (kind == WD_OK) continue;
+            fprintf(stderr,
+                    "\n[watchdog] camera %d: %s thread %s - forcing restart\n",
+                    g_cams[ci].cam_id, g_wd_role_name[role],
+                    kind == WD_EXITED ? "exited while streaming"
+                                      : "stalled (no heartbeat for >5 s)");
+            fflush(NULL);
+            _exit(2);   // cannot safely unwind a possibly-wedged pipeline
+                        // in-process; exit non-zero so the external supervisor
+                        // (systemd / launch script) restarts the whole app.
+        }
+    }
+    printf("Watchdog thread stopped.\n");
 }
 
 // ============== DMA-BUF alloc + mmap ==============
@@ -277,6 +378,7 @@ static int v4l2_init(CameraPipeline *cam, const char *node, int width, int heigh
 
 // ============== Capture thread: V4L2 + RGA ==============
 static void capture_thread_func(CameraPipeline *cam) {
+    WorkerExitFlag wd_flag(cam->wd_exited[WD_ROLE_CAP]);
     for (int i = 0; i < BUFFER_COUNT; i++) {
         struct v4l2_buffer buf = {0};
         struct v4l2_plane planes[2];
@@ -301,6 +403,7 @@ static void capture_thread_func(CameraPipeline *cam) {
         return;
     }
     cam->capture_ready.store(1, std::memory_order_release);
+    cam->wd_hb_us[WD_ROLE_CAP].store(now_monotonic_us(), std::memory_order_release);
     printf("Capture thread[%d] started (MPP zero-copy).\n", cam->cam_id);
 
     float scale = std::min((float)cam->model_width / cam->capture_width,
@@ -439,6 +542,9 @@ static void capture_thread_func(CameraPipeline *cam) {
         planes[0].length = cam->capture_width * cam->capture_height;
         planes[1].length = planes[0].length / 2;
         if (ioctl(cam->v4l_fd, VIDIOC_QBUF, &buf) < 0) perror("QBUF");
+
+        // A frame made it all the way through RGA -> encoder handoff: alive.
+        cam->wd_hb_us[WD_ROLE_CAP].store(now_monotonic_us(), std::memory_order_release);
     }
 
     ioctl(cam->v4l_fd, VIDIOC_STREAMOFF, &type);
@@ -447,6 +553,7 @@ static void capture_thread_func(CameraPipeline *cam) {
 
 // ============== Inference thread ==============
 static void inference_thread_func(CameraPipeline *cam) {
+    WorkerExitFlag wd_flag(cam->wd_exited[WD_ROLE_INF]);
     printf("Inference thread[%d] started.\n", cam->cam_id);
     int last_idx = -1;
 
@@ -525,6 +632,7 @@ static void inference_thread_func(CameraPipeline *cam) {
                                       (uint32_t)sock_results.size());
             }
         }
+        cam->wd_hb_us[WD_ROLE_INF].store(now_monotonic_us(), std::memory_order_release);
         cam->inference_alive.store(true);
     }
     cam->inference_alive.store(false);
@@ -619,6 +727,7 @@ static int init_mpp_encoder(CameraPipeline *cam) {
 // (encode_put_frame), retrieves the encoded H.265 access unit, copies the few
 // KB into a GstBuffer and broadcasts it to every connected client's appsrc.
 static void mpp_encode_thread_func(CameraPipeline *cam) {
+    WorkerExitFlag wd_flag(cam->wd_exited[WD_ROLE_ENC]);
     printf("MPP encode thread[%d] started.\n", cam->cam_id);
 
     while (g_running) {
@@ -673,6 +782,8 @@ static void mpp_encode_thread_func(CameraPipeline *cam) {
                     gst_buffer_unmap(buffer, &map);
 
                     cam->out_frames++;
+                    cam->wd_hb_us[WD_ROLE_ENC].store(now_monotonic_us(),
+                                                     std::memory_order_release);
 
                     // Broadcast to every connected client's appsrc (temp refs).
                     std::vector<GstElement *> live;
@@ -949,6 +1060,9 @@ int main(int argc, char *argv[]) {
 
     start_rtsp_server(rtsp_port, &g_cams[0], &g_cams[1]);
 
+    // Watchdog supervises the worker threads from here on.
+    std::thread watchdog(watchdog_thread_func);
+
     if (result_socket_start((uint16_t)socket_port,
                             (uint32_t)g_cams[0].stream_width,
                             (uint32_t)g_cams[0].stream_height) < 0) {
@@ -964,6 +1078,7 @@ int main(int argc, char *argv[]) {
     g_main_loop_unref(loop);
 
     for (auto &t : threads) t.join();
+    if (watchdog.joinable()) watchdog.join();
 
     cleanup();
     printf("Exit normally\n");
